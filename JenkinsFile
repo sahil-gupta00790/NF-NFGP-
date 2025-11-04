@@ -1,0 +1,143 @@
+pipeline {
+    agent any // Run on Jenkins master
+
+    environment {
+        AWS_REGION = 'us-east-1' // Match your Terraform region
+        // ECR repository URLs will be determined from Terraform outputs or hardcoded if known
+        // Alternatively, query them using AWS CLI if Jenkins EC2 role has permissions
+        FRONTEND_ECR_REPO_URL = readJSON(file: 'terraform_outputs.json').frontend_ecr_repository_url.value // Example assuming you output Terraform outputs to a JSON file accessible to Jenkins
+        BACKEND_ECR_REPO_URL  = readJSON(file: 'terraform_outputs.json').backend_ecr_repository_url.value
+        PROJECT_NAME          = 'neuroforge' // Match your var.project_name
+        ECS_CLUSTER_NAME      = "${PROJECT_NAME}-cluster"
+        ECS_SERVICE_NAME      = "${PROJECT_NAME}-app-service" // Service managing the combined task
+        ECS_TASK_FAMILY       = "${PROJECT_NAME}-app"       // Task definition family
+
+        // For unique image tags
+        IMAGE_TAG = "build-${env.BUILD_NUMBER}"
+    }
+
+    tools {
+        // If you configured specific Docker/JDK installations in Jenkins Global Tool Configuration
+        // docker 'Default'
+        // jdk 'JDK11'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                cleanWs()
+                checkout scm
+                echo "Code checked out."
+                // After checkout, get Terraform outputs to populate ECR URLs
+                // This assumes you run `terraform output -json > terraform_outputs.json` after applying Terraform
+                // and this file is somehow made available or you query outputs differently.
+                // For simplicity in this example, you might hardcode them if they don't change often
+                // or use AWS CLI if Jenkins has permissions and tools installed.
+                // sh "aws ecr describe-repositories --repository-names ${PROJECT_NAME}/frontend --region ${AWS_REGION} --query 'repositories[0].repositoryUri' --output text > frontend_ecr_url.txt"
+                // script {
+                //     env.FRONTEND_ECR_REPO_URL = readFile('frontend_ecr_url.txt').trim()
+                //     // similarly for backend
+                // }
+            }
+        }
+
+        stage('Setup Environment (.env files)') {
+            steps {
+                echo "Setting up .env files for Docker image builds if necessary (should be ARG in Dockerfile or build-time secrets)"
+                // Example: If your Dockerfiles expect build ARGs for NEXT_PUBLIC_API_URL
+                // For production images, NEXT_PUBLIC_API_URL inside frontend image should point to ALB DNS
+                // This is different from the one in ECS Task Definition for intra-task communication.
+                // This part needs careful handling of how frontend image is built with public API URL.
+                // Simplest is to have frontend image take it as runtime ENV VAR and ECS task def sets it.
+            }
+        }
+
+        stage('Build & Push Frontend Image') {
+            steps {
+                dir('neural-nexus-frontend') { // Change to your frontend directory
+                    script {
+                        def fullImageName = "${FRONTEND_ECR_REPO_URL}:${IMAGE_TAG}"
+                        // Login to ECR (Jenkins EC2 instance role should grant this)
+                        sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${env.FRONTEND_ECR_REPO_URL.split('/')[0]}"
+                        echo "Building frontend Docker image: ${fullImageName}"
+                        sh "docker build -t ${fullImageName} -f Dockerfile.frontend ."
+                        echo "Pushing frontend Docker image to ECR..."
+                        sh "docker push ${fullImageName}"
+                        env.FRONTEND_IMAGE_URI_WITH_TAG = fullImageName
+                    }
+                }
+            }
+        }
+
+        stage('Build & Push Backend/Worker Image') {
+            steps {
+                dir('neural-nexus-backend') { // Change to your backend directory
+                     script {
+                        def fullImageName = "${BACKEND_ECR_REPO_URL}:${IMAGE_TAG}"
+                        sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${env.BACKEND_ECR_REPO_URL.split('/')[0]}"
+                        echo "Building backend Docker image: ${fullImageName}"
+                        sh "docker build -t ${fullImageName} -f Dockerfile.backend ."
+                        echo "Pushing backend Docker image to ECR..."
+                        sh "docker push ${fullImageName}"
+                        env.BACKEND_IMAGE_URI_WITH_TAG = fullImageName
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to ECS') {
+            steps {
+                script {
+                    // 1. Create a new Task Definition revision with the new image URIs
+                    // Get current task definition
+                    def taskDefJson = sh(script: "aws ecs describe-task-definition --task-definition ${ECS_TASK_FAMILY} --region ${AWS_REGION} --query taskDefinition", returnStdout: true).trim()
+                    def taskDef = readJSON text: taskDefJson
+
+                    // Update image URIs in container definitions
+                    taskDef.containerDefinitions.find { it.name == "${PROJECT_NAME}-frontend" }.image = env.FRONTEND_IMAGE_URI_WITH_TAG
+                    taskDef.containerDefinitions.find { it.name == "${PROJECT_NAME}-backend" }.image = env.BACKEND_IMAGE_URI_WITH_TAG
+                    taskDef.containerDefinitions.find { it.name == "${PROJECT_NAME}-celeryworker" }.image = env.BACKEND_IMAGE_URI_WITH_TAG
+                    // Redis image is likely from Docker Hub, might not change often, or could also be tagged/pushed
+
+                    // Parameters not allowed when registering new revision from existing one
+                    def newContainerDefinitions = taskDef.containerDefinitions
+                    def newTaskDefPayload = [
+                        family: taskDef.family,
+                        executionRoleArn: taskDef.executionRoleArn,
+                        networkMode: taskDef.networkMode,
+                        containerDefinitions: newContainerDefinitions,
+                        requiresCompatibilities: taskDef.requiresCompatibilities,
+                        cpu: taskDef.cpu,
+                        memory: taskDef.memory
+                        // Add taskRoleArn if you use it
+                        // Add volumes if you use them
+                    ]
+                    def newTaskDefJson = writeJSON(json: newTaskDefPayload, returnText: true)
+
+                    // Register new task definition revision
+                    sh "aws ecs register-task-definition --cli-input-json '${newTaskDefJson}' --region ${AWS_REGION}"
+
+                    // 2. Update the ECS Service to use the new task definition revision
+                    // This will trigger a new deployment
+                    sh "aws ecs update-service --cluster ${ECS_CLUSTER_NAME} --service ${ECS_SERVICE_NAME} --task-definition ${ECS_TASK_FAMILY} --force-new-deployment --region ${AWS_REGION}"
+                    echo "ECS service update initiated."
+
+                    // Optional: Wait for deployment to complete
+                    // sh "aws ecs wait services-stable --cluster ${ECS_CLUSTER_NAME} --services ${ECS_SERVICE_NAME} --region ${AWS_REGION}"
+                    // echo "ECS deployment stable."
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo 'Pipeline finished.'
+        }
+        success {
+            echo "Deployment to ECS Succeeded for tag ${IMAGE_TAG}!"
+        }
+        failure {
+            echo 'Deployment Failed!'
+        }
+    }
+}
