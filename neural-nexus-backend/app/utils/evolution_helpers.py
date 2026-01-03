@@ -549,4 +549,77 @@ def mutate_weights_uniform_random(
     mutated_chromosome[num_hyperparams:] = weights
     return mutated_chromosome
 
+##NSGA Helper Functions
+
+def fast_non_dominated_sort(obj_scores: np.ndarray) -> List[List[int]]:
+    """
+    Implements the NSGA-II non-dominated sorting.
+    Organizes individuals into 'Fronts' based on dominance.
+    """
+    num_individuals = obj_scores.shape[0]
+    domination_count = np.zeros(num_individuals)
+    dominated_indices = [[] for _ in range(num_individuals)]
+    fronts = [[]]
+
+    for p in range(num_individuals):
+        for q in range(num_individuals):
+            # If p dominates q
+            if all(obj_scores[p] >= obj_scores[q]) and any(obj_scores[p] > obj_scores[q]):
+                dominated_indices[p].append(q)
+            # If q dominates p
+            elif all(obj_scores[q] >= obj_scores[p]) and any(obj_scores[q] > obj_scores[p]):
+                domination_count[p] += 1
+        
+        if domination_count[p] == 0:
+            fronts[0].append(p)
+
+    i = 0
+    while len(fronts[i]) > 0:
+        next_front = []
+        for p in fronts[i]:
+            for q in dominated_indices[p]:
+                domination_count[q] -= 1
+                if domination_count[q] == 0:
+                    next_front.append(q)
+        i += 1
+        fronts.append(next_front)
+    return fronts[:-1]
+
+def calculate_crowding_distance(obj_scores: np.ndarray, front: List[int]) -> np.ndarray:
+    """
+    Calculates crowding distance to maintain diversity on the Pareto front.
+    """
+    distances = np.zeros(len(front))
+    num_objectives = obj_scores.shape[1]
+    
+    for m in range(num_objectives):
+        # Sort front based on objective m
+        sorted_indices = sorted(range(len(front)), key=lambda x: obj_scores[front[x], m])
+        distances[sorted_indices[0]] = np.inf
+        distances[sorted_indices[-1]] = np.inf
+        
+        obj_range = obj_scores[front[sorted_indices[-1]], m] - obj_scores[front[sorted_indices[0]], m]
+        if obj_range == 0: continue
+        
+        for i in range(1, len(front) - 1):
+            distances[sorted_indices[i]] += (obj_scores[front[sorted_indices[i+1]], m] - 
+                                           obj_scores[front[sorted_indices[i-1]], m]) / obj_range
+    return distances
+
+def evaluate_population_multi_objective(
+    population: List[np.ndarray],
+    task_eval_func,
+    device: torch.device,
+    # ... other args ...
+) -> np.ndarray:
+    """
+    Evaluates population and returns a 2D array [pop_size, num_objectives].
+    """
+    all_obj_scores = []
+    for chromosome in population:
+        # The eval func must now return a LIST, e.g., [Accuracy, Confidence]
+        scores = task_eval_func(chromosome, device) 
+        all_obj_scores.append(scores)
+    return np.array(all_obj_scores)
+
 # --- End of Helper Functions ---
