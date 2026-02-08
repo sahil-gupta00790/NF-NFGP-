@@ -1,0 +1,38 @@
+{
+  "model_class": "SimpleCNN",
+  "generations": 3,
+  "population_size": 5,
+  "selection_strategy": "tournament",
+  "crossover_operator": "one_point",
+  "mutation_operator": "gaussian",
+  "mutation_rate": 0.1,
+  "mutation_strength": 0.05,
+  "elitism_count": 1,
+  "evolvable_hyperparams": {
+    "num_filters": {
+      "type": "int",
+      "range": [
+        16,
+        64
+      ]
+    },
+    "dropout_rate": {
+      "type": "float",
+      "range": [
+        0.1,
+        0.7
+      ]
+    }
+  },
+  "model_kwargs": {},
+  "eval_config": {
+    "batch_size": 128
+  },
+  "use_fuzzy": true,
+  "fuzzy_config": {
+    "num_inputs": 5,
+    "num_rules": 5,
+    "membership_per_input": 3,
+    "alpha": 0.7
+  }
+}

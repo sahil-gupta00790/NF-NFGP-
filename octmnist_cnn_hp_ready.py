@@ -7,7 +7,7 @@ import logging # Optional: Use logging instead of print for better practice
 
 logger = logging.getLogger(__name__)
 
-class MyCNN(nn.Module):
+class OCTMNIST_CNN(nn.Module):
     """
     OCTMNIST CNN adapted for hyperparameter evolution.
     Assumes input 1x28x28 images.
@@ -112,7 +112,7 @@ if __name__ == '__main__':
 
     # Example: Instantiate with default hyperparameters
     print("Instantiating with default hyperparameters:")
-    model_default = MyCNN()
+    model_default = OCTMNIST_CNN()
     print(model_default)
 
     # Example: Instantiate with evolved hyperparameters
@@ -124,7 +124,7 @@ if __name__ == '__main__':
         'neurons_fc1': 55,
         'dropout_rate': 0.3
     }
-    model_evolved = MyCNN(input_channels=1, num_classes=4, **evolved_params)
+    model_evolved = OCTMNIST_CNN(input_channels=1, num_classes=4, **evolved_params)
     print(model_evolved)
 
     # Test forward pass with dummy data (assuming 1x28x28 input)
@@ -135,4 +135,3 @@ if __name__ == '__main__':
         print(f"Output shape: {output.shape}") # Expected: [2, 4]
     except Exception as e:
         print(f"Forward pass failed: {e}")
-

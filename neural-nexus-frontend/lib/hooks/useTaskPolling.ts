@@ -13,12 +13,14 @@ interface TaskResultData {
     best_fitness?: number | null;
     message?: string;
     error?: string;
+    avg_objectives?: number[][] | null;
     // Add fields for the new metric histories
     fitness_history?: number[] | null; // Max fitness history
     avg_fitness_history?: number[] | null;
     diversity_history?: number[] | null;
     // Added based on task return values
     best_hyperparameters?: Record<string, any> | null;
+    best_fuzzy_parameters?: Record<string, any> | null;
     status?: string; // Could be included in result/meta, e.g., HALTED_BY_USER
 }
 
@@ -44,12 +46,13 @@ interface TaskState {
     message: string | null;
     error: string | null;
     isActive: boolean;
+    avgObjectives: number[][] | null;
 }
 
 const initialState: TaskState = {
     taskId: null, status: null, progress: null, result: null,
     fitnessHistory: null, avgFitnessHistory: null, diversityHistory: null,
-    message: null, error: null, isActive: false
+    message: null, error: null, isActive: false,avgObjectives: null,
 };
 
 // Terminal states that should stop polling
@@ -78,81 +81,57 @@ export function useTaskPolling(endpoint: 'evolver', intervalMs = 3000) {
 
     // Function to poll status API
     const pollStatus = useCallback(async () => {
-        const taskId = currentTaskIdRef.current;
-        if (!taskId) { stopPolling(); return; }
+    if (!currentTaskIdRef.current) return;
 
-        try {
-            const data: TaskStatusResponse = await getTaskStatus('evolver', taskId);
+    try {
+        const data: TaskStatusResponse = await getTaskStatus(currentTaskIdRef.current);
+        const info = data.info || data.result;
+        // Update basic status and progress
+        setTaskState(prev => {
+    
+    return {
+        ...prev,
+        status: data.status,
+        progress: data.progress ?? prev.progress,
+        message: data.message || prev.message,
+        // Only update these if info exists, otherwise keep previous
+        fitnessHistory: info?.fitness_history || prev.fitnessHistory,
+        avgFitnessHistory: info?.avg_fitness_history || prev.avgFitnessHistory,
+        diversityHistory: info?.diversity_history || prev.diversityHistory,
+        avgObjectives: info?.avg_objectives || prev.avgObjectives, 
+        result: data.status === 'SUCCESS' ? info : prev.result,
+        isActive: !TERMINAL_STATES.includes(data.status)
+    };
+});
+        
 
-            setTaskState(prev => {
-                if (prev.taskId !== taskId) return prev; // Ignore if task changed
-
-                // Determine terminal state
-                const isTerminal = TERMINAL_STATES.includes(data.status);
-
-                // Determine the source of metadata based on status
-                // Use 'info' for intermediate/halted states, 'result' for final SUCCESS/FAILURE
-                // Fallback to an empty object if neither exists
-                const metaSource = (data.status === 'PROGRESS' || data.status === 'REVOKED' || data.status === 'HALTED')
-                    ? data.info
-                    : (data.status === 'SUCCESS' || data.status === 'FAILURE'
-                        ? data.result
-                        : null)
-                    || {}; // Ensure metaSource is always an object or null
-
-                const finalResultData = (data.status === 'SUCCESS' || data.status === 'FAILURE') ? data.result : null;
-
-                // Extract Histories safely from the metaSource (could be info or result)
-                const nextFitnessHistory = metaSource?.fitness_history && Array.isArray(metaSource.fitness_history) ? metaSource.fitness_history : prev.fitnessHistory;
-                const nextAvgFitnessHistory = metaSource?.avg_fitness_history && Array.isArray(metaSource.avg_fitness_history) ? metaSource.avg_fitness_history : prev.avgFitnessHistory;
-                const nextDiversityHistory = metaSource?.diversity_history && Array.isArray(metaSource.diversity_history) ? metaSource.diversity_history : prev.diversityHistory;
-
-                // Extract Progress (usually in 'info' during PROGRESS)
-                const nextProgress = (data.status === 'PROGRESS' && typeof metaSource?.progress === 'number') ? metaSource.progress : (isTerminal ? 1.0 : prev.progress); // Set to 1 on any terminal state
-
-                // Extract Message (Prioritize metaSource message, then top-level message)
-                const nextMessage = metaSource?.message || data.message || prev.message;
-
-                // Extract Error (usually in 'result' on FAILURE)
-                const nextError = data.status === 'FAILURE' ? (finalResultData?.error || finalResultData?.message || 'Task failed') : null;
-
-                const newState: TaskState = {
-                    ...prev,
-                    status: data.status,
-                    progress: nextProgress,
-                    // Store final result for SUCCESS/FAILURE, store meta for HALTED/REVOKED for consistency
-                    result: (data.status === 'SUCCESS' || data.status === 'FAILURE') ? finalResultData : (data.status === 'REVOKED' || data.status === 'HALTED' ? metaSource : null),
-                    fitnessHistory: nextFitnessHistory,
-                    avgFitnessHistory: nextAvgFitnessHistory,
-                    diversityHistory: nextDiversityHistory,
-                    message: nextMessage,
-                    error: nextError,
-                    isActive: !isTerminal, // Set isActive based on whether it's a terminal state
-                };
-
-                // Handle Side Effects (Toasts) - outside state update logic
-                if (isTerminal && prev.status !== data.status) { // Only toast on final state *change*
-                    if (data.status === 'SUCCESS') toast.success(`Task ${taskId} completed!`);
-                    else if (data.status === 'FAILURE') toast.error(`Task ${taskId} failed: ${newState.error || 'Unknown error'}`);
-                    else if (data.status === 'REVOKED') toast.warning(`Task ${taskId} was revoked.`);
-                    else if (data.status === 'HALTED') toast.info(`Task ${taskId} was halted.`); // Add toast for HALTED
-                }
-                return newState;
-            });
-
-            // Stop interval *after* state update if a terminal state was reached
-             if (TERMINAL_STATES.includes(data.status)) {
-                 stopPolling();
-             }
-
-        } catch (error: any) {
-            console.error(`Polling error for task ${taskId}:`, error);
-            const errorMsg = error.message || 'Polling request failed';
-            setTaskState(prev => ({ ...prev, error: errorMsg, isActive: false })); // Set inactive on polling error
-            toast.error(`Polling Error: ${errorMsg}`);
-            stopPolling(); // Stop polling on error
+        // Handle Errors
+        if (data.status === 'FAILURE') {
+            const errorMsg = info?.error || data.message || 'Task failed';
+            setTaskState(prev => ({ ...prev, error: errorMsg, isActive: false }));
+            toast.error(`Evolution Failed: ${errorMsg}`);
+            stopPolling();
         }
-    }, [stopPolling, intervalMs]); // Dependencies for pollStatus
+
+        // Handle Halted state
+        if (data.status === 'HALTED') {
+            setTaskState(prev => ({ ...prev, isActive: false }));
+            toast.info("Evolution halted by user.");
+            stopPolling();
+        }
+
+        // Stop polling if we reached a terminal state
+        if (TERMINAL_STATES.includes(data.status)) {
+            setTaskState(prev => ({ ...prev, isActive: false }));
+            stopPolling();
+        }
+
+    } catch (err: any) {
+        console.error("Polling error:", err);
+        // Don't stop polling immediately on one network error, but update state
+        setTaskState(prev => ({ ...prev, error: "Connection lost. Retrying..." }));
+    }
+}, [stopPolling]);// Dependencies for pollStatus
 
     // Function to start a new task and polling
     const startTask = useCallback((taskId: string) => {

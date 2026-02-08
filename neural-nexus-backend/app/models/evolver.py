@@ -1,30 +1,42 @@
 # app/models/evolver.py
 from pydantic import BaseModel, Field
-from typing import Any # Import Any for nested dicts
+from typing import Any, Dict, List, Optional
 
 class EvolverConfig(BaseModel):
     # --- REQUIRED ---
-    model_class: str = Field(..., description="Name of the model class in the definition file.") # Make mandatory
+    model_class: str = Field(..., description="Name of the model class in the definition file.")
     generations: int = Field(..., gt=0, description="Number of generations to run.")
     population_size: int = Field(..., gt=1, description="Number of individuals in the population.")
 
-    # --- ADD ALL OTHER EXPECTED FIELDS ---
-    selection_strategy: str | None = Field(default="tournament", description="Parent selection strategy (e.g., tournament, roulette)")
-    crossover_operator: str | None = Field(default="one_point", description="Crossover operator (e.g., one_point, uniform)")
-    mutation_operator: str | None = Field(default="gaussian", description="Mutation operator (e.g., gaussian, uniform_random)")
-    elitism_count: int | None = Field(default=1, ge=0, description="Number of best individuals to carry over.")
-    mutation_rate: float | None = Field(default=0.1, ge=0.0, le=1.0, description="Probability of mutation.")
-    mutation_strength: float | None = Field(default=0.05, description="Strength/std deviation for mutation (esp. Gaussian).")
-    tournament_size: int | None = Field(default=3, gt=1, description="Size of tournament for selection.")
-    uniform_crossover_prob: float | None = Field(default=0.5, ge=0.0, le=1.0, description="Probability for uniform crossover swap.")
-    uniform_mutation_range: tuple[float, float] | None = Field(default=(-1.0, 1.0), description="Range for uniform random mutation.")
-    init_mutation_rate: float | None = Field(default=None, ge=0.0, le=1.0, description="Initial mutation rate (defaults to mutation_rate if None).")
-    init_mutation_strength: float | None = Field(default=None, description="Initial mutation strength (defaults to mutation_strength if None).")
-    model_args: list | None = Field(default=None, description="Positional arguments for model constructor.")
-    model_kwargs: dict | None = Field(default=None, description="Keyword arguments for model constructor.")
-    eval_config: dict[str, Any] | None = Field(default=None, description="Configuration dictionary for the evaluation script.")
+    # --- NSGA-II & MULTI-OBJECTIVE ---
+    nsga2_enabled: bool = Field(default=False, description="Enable Non-Dominated Sorting for multi-objective optimization.")
+    # If False, the system defaults to single-objective (Accuracy).
+    
+    # --- NEURO-FUZZY CO-EVOLUTION ---
+    use_fuzzy: bool = Field(default=False, description="Enable co-evolution of fuzzy logic behavioral rules.")
+    num_fuzzy_params: int = Field(default=10, ge=0, description="Number of genes allocated to fuzzy membership functions/rules.")
 
-    # Allow extra fields if needed, but defining them is better
+    # --- HYPERPARAMETER EVOLUTION ---
+    # This stores the ranges/types for parameters like 'learning_rate' or 'dropout'
+    evolvable_hyperparams_config: Optional[Dict[str, Any]] = Field(
+        default=None, 
+        description="Schema defining which hyperparameters to evolve and their bounds."
+    )
+
+    # --- STANDARD GA SETTINGS ---
+    selection_strategy: str = Field(default="tournament")
+    crossover_operator: str = Field(default="one_point")
+    mutation_operator: str = Field(default="gaussian")
+    elitism_count: int = Field(default=1, ge=0)
+    mutation_rate: float = Field(default=0.1, ge=0.0, le=1.0)
+    mutation_strength: float = Field(default=0.05)
+    tournament_size: int = Field(default=3, gt=1)
+    
+    # --- MODEL ARGS ---
+    model_args: Optional[List[Any]] = Field(default=None)
+    model_kwargs: Optional[Dict[str, Any]] = Field(default=None)
+    eval_config: Optional[Dict[str, Any]] = Field(default=None)
+
     model_config = {
-        "extra": "ignore" # Or "allow" if you truly want unexpected fields
+        "extra": "ignore"
     }

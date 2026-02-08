@@ -12,6 +12,7 @@ interface GeminiHistoryItem {
 interface GaAnalysisPayload {
     fitness_history: number[];
     avg_fitness_history: number[] | null;
+    avg_objectives?: number[][] | null;
     diversity_history: number[] | null;
     generations: number;
     population_size: number;
@@ -32,6 +33,7 @@ interface GaAnalysisPayload {
     // Hyperparameters
     evolvable_hyperparams?: Record<string, any> | null;
     best_hyperparameters?: Record<string, any> | null;
+    front_0_count?: number;
 }
 
 interface GaAnalysisResponse {
@@ -99,7 +101,7 @@ export async function analyzeGaResults(data: GaAnalysisPayload): Promise<GaAnaly
     return response.json();
 }
 
-export async function getTaskStatus(endpoint: 'evolver', taskId: string) {
+export async function getTaskStatus(taskId: string,endpoint: 'evolver'='evolver') {
     if (endpoint !== 'evolver') {
         // This basic check can remain, or be expanded if other task types are added
         throw new Error(`Invalid endpoint type passed to getTaskStatus: ${endpoint}`);

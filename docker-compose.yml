@@ -33,13 +33,6 @@ services:
         condition: service_started # Or service_healthy if Redis has a healthcheck
     env_file:
       - .env
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     networks:
       - app_network
     healthcheck: # <<< ADDED HEALTHCHECK FOR BACKEND
@@ -67,13 +60,6 @@ services:
         condition: service_healthy # Wait for backend to be healthy
     env_file:
       - .env
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     networks:
       - app_network
 

@@ -1,3 +1,4 @@
+
 # octmnist_evaluation.py
 
 import torch
@@ -103,90 +104,79 @@ def get_octmnist_test_loader(device):
 # --- The Fitness Function ---
 
 # Keep the function signature the same as the template
-def evaluate_network_on_task(model_instance: torch.nn.Module, config: dict) -> float:
+def evaluate_network_on_task(model_instance: torch.nn.Module, config: dict) -> list[float]:
     """
-    Evaluates the performance (accuracy) of the given model instance
-    on the OCTMNIST test dataset (or a subset). Uses AMP if on CUDA.
-
-    Args:
-        model_instance (torch.nn.Module): An instance of your network with weights loaded.
-        device (torch.device): The device ('cuda' or 'cpu') to run evaluation on.
-        config (dict): Configuration dictionary (currently unused here but required by caller).
-
-    Returns:
-        float: The test accuracy (between 0.0 and 1.0). Higher is better.
-               Returns -float('inf') if evaluation fails.
+    Evaluates the network across multiple objectives for NSGA-II.
+    
+    Objectives returned: [Accuracy, Mean_Confidence, Latency_ms]
+    Aligns with Feature Bible Sections 1.1 (Multi-Objective) and 2.1 (Fuzzy Behavioral).
     """
     eval_start_time = time.time()
-    fitness = 0.0 # Default fitness
+    
+    # Initialize trackers
+    total_samples = 0
+    correct_predictions = 0
+    confidences = []
+    inference_times = []
 
     try:
-        device = config.get('device')
-        if not isinstance(device, torch.device): # Basic check
-             logger.error(f"Invalid or missing 'device' in config: {device}. Falling back to CPU.")
-             # Decide: Fallback or raise? Fallback might hide issues. Raising is safer.
-             # device = torch.device('cpu')
-             raise ValueError(f"Invalid or missing 'device' in config dict: {config}")
-
-        # 1. Get the test data loader for OCTMNIST
+        device = config.get('device', torch.device('cpu'))
+        # Using the loader defined in your previous file
         test_loader = get_octmnist_test_loader(device)
 
-        # 2. Set up model for evaluation
         model_instance.to(device)
         model_instance.eval()
 
-        correct_predictions = 0
-        total_samples = 0
-        samples_processed_count = 0 # Counter for subset evaluation
-
-        # 3. Iterate through the test dataset without calculating gradients
         with torch.no_grad():
             for inputs, labels in test_loader:
-                # --- Subset Evaluation Check ---
-                if SAMPLES_TO_EVALUATE is not None and samples_processed_count >= SAMPLES_TO_EVALUATE:
-                    break # Stop iterating early
+                # --- Subset Evaluation Check (from your config) ---
+                if SAMPLES_TO_EVALUATE is not None and total_samples >= SAMPLES_TO_EVALUATE:
+                    break
 
-                # Move data to the specified device
                 inputs = inputs.to(device)
-                labels = labels.to(device).squeeze() # Squeeze label tensor if it's [N, 1] -> [N]
+                labels = labels.to(device).squeeze()
 
-                # --- Automatic Mixed Precision (AMP) ---
+                # 1. LATENCY TRACKING (Objective 3)
+                # We time only the forward pass to measure pure model efficiency
+                start_batch = time.perf_counter()
+                
                 if device.type == 'cuda':
                     with torch.amp.autocast(device_type='cuda', enabled=True):
                         outputs = model_instance(inputs)
                 else:
-                    outputs = model_instance(inputs) # Run without autocast on CPU
+                    outputs = model_instance(inputs)
+                
+                end_batch = time.perf_counter()
+                inference_times.append((end_batch - start_batch) / labels.size(0))
 
-                # Get predictions (class with the highest logit)
+                # 2. ACCURACY TRACKING (Objective 1)
                 _, predicted_classes = torch.max(outputs.data, 1)
-
-                # Update counts
-                batch_size_actual = labels.size(0)
-                total_samples += batch_size_actual
                 correct_predictions += (predicted_classes == labels).sum().item()
-                samples_processed_count += batch_size_actual # Update subset counter
+                total_samples += labels.size(0)
 
-        # 4. Calculate accuracy based on samples evaluated
-        if total_samples > 0:
-            accuracy = correct_predictions / total_samples
-            fitness = float(accuracy)
-        else:
-            logger.warning(" Warning: Zero samples evaluated. Check SAMPLES_TO_EVALUATE and dataset.")
-            fitness = 0.0
+                # 3. CONFIDENCE TRACKING (Objective 2) [Bible 2.1 Behavioral Signal]
+                # High confidence indicates a 'stable' and 'certain' model
+                probs = F.softmax(outputs, dim=1)
+                max_probs, _ = torch.max(probs, dim=1)
+                confidences.extend(max_probs.cpu().numpy().tolist())
 
-        eval_time = time.time() - eval_start_time
-        amp_info = "(AMP enabled)" if device.type == 'cuda' else "(AMP disabled/CPU)"
-        subset_info = f"on {total_samples} samples" if SAMPLES_TO_EVALUATE is not None else "on full dataset"
-        logger.debug(f" (Eval {task_id if 'task_id' in locals() else ''} took {eval_time:.3f}s {amp_info}, Accuracy: {fitness:.4f} {subset_info})")
+        # Aggregate Results
+        accuracy = correct_predictions / total_samples if total_samples > 0 else 0.0
+        avg_confidence = np.mean(confidences) if confidences else 0.0
+        avg_latency_ms = (np.mean(inference_times) * 1000) if inference_times else 999.0
+
+        logger.info(f"Eval Complete - Acc: {accuracy:.4f}, Conf: {avg_confidence:.4f}, Latency: {avg_latency_ms:.4f}ms")
+
+        # RETURN LIST FOR NSGA-II [Bible 1.1]
+        # Important: NSGA-II expects to MAXIMIZE values. 
+        # Since we want to MINIMIZE latency, we return it as a negative value or 1/latency.
+        # We will use negative latency so "higher" is better.
+        return [float(accuracy), float(avg_confidence), float(-avg_latency_ms)]
 
     except Exception as e:
-        logger.error(f" ERROR during fitness evaluation: {e}", exc_info=True)
-        return [0.0, 0.0, 0.0] # Return multi-objective format on error
-
-    # Return multi-objective format: [accuracy, confidence, -latency]
-    confidence = fitness  # Use accuracy as confidence proxy
-    latency = eval_time   # Use evaluation time as latency proxy
-    return [float(fitness), float(confidence), -float(latency)]
+        logger.error(f"Critical error in evaluate_network_on_task: {e}", exc_info=True)
+        # Return worst-case scores on failure so individual is penalized but doesn't crash evolution
+        return [0.0, 0.0, -999.0]
 
 # --- Optional: Add a main block for testing this file directly ---
 if __name__ == '__main__':
@@ -226,4 +216,3 @@ if __name__ == '__main__':
         logger.error(f"Import Error: {imp_err}")
     except Exception as e:
         logger.error(f"\nAn error occurred during direct testing: {e}", exc_info=True)
-
