@@ -662,4 +662,146 @@ def mutate_weights_uniform_random(
     mutated_chromosome[weights_start:] = weights
     return mutated_chromosome
 
+def fast_non_dominated_sort(obj_scores: np.ndarray) -> List[List[int]]:
+    """
+    Computes Pareto Fronts for Multi-Objective Optimization.
+    obj_scores: Array of shape (pop_size, num_objectives)
+    Returns: List of lists, where each inner list contains indices of a front.
+    """
+    pop_size = obj_scores.shape[0]
+    domination_count = np.zeros(pop_size)
+    dominated_solutions = [[] for _ in range(pop_size)]
+    fronts = [[]]
+
+    for p in range(pop_size):
+        for q in range(pop_size):
+            # p dominates q if it is better or equal in all objectives 
+            # and strictly better in at least one.
+            if all(obj_scores[p] >= obj_scores[q]) and any(obj_scores[p] > obj_scores[q]):
+                dominated_solutions[p].append(q)
+            elif all(obj_scores[q] >= obj_scores[p]) and any(obj_scores[q] > obj_scores[p]):
+                domination_count[p] += 1
+        
+        if domination_count[p] == 0:
+            fronts[0].append(p)
+
+    i = 0
+    while len(fronts[i]) > 0:
+        next_front = []
+        for p in fronts[i]:
+            for q in dominated_solutions[p]:
+                domination_count[q] -= 1
+                if domination_count[q] == 0:
+                    next_front.append(q)
+        i += 1
+        fronts.append(next_front)
+    return fronts[:-1]
+
+def calculate_crowding_distance(obj_scores: np.ndarray, front: List[int]) -> np.ndarray:
+    """
+    Measures how close an individual is to its neighbors in objective space.
+    Higher distance = More unique/diverse solution.
+    """
+    distances = np.zeros(len(front))
+    num_objs = obj_scores.shape[1]
+    
+    for m in range(num_objs):
+        # Sort front by objective m
+        sorted_indices = sorted(range(len(front)), key=lambda k: obj_scores[front[k], m])
+        
+        # Boundary points always get infinite distance (highly prioritized)
+        distances[sorted_indices[0]] = float('inf')
+        distances[sorted_indices[-1]] = float('inf')
+        
+        obj_range = obj_scores[front[sorted_indices[-1]], m] - obj_scores[front[sorted_indices[0]], m]
+        if obj_range == 0: continue
+            
+        for i in range(1, len(front) - 1):
+            distances[sorted_indices[i]] += (obj_scores[front[sorted_indices[i+1]], m] - 
+                                           obj_scores[front[sorted_indices[i-1]], m]) / obj_range
+    return distances
+
+def evaluate_population_multi_objective(
+    population: List[np.ndarray],
+    model_definition_path: str,
+    class_name: str,
+    task_eval_func: callable,
+    device: torch.device,
+    model_args_static: List[Any],
+    model_kwargs_static: Dict[str, Any],
+    eval_config: Dict[str, Any],
+    num_hyperparams: int,
+    evolvable_hyperparams_config: Dict[str, Dict[str, Any]],
+    use_fuzzy: bool = False,
+    num_fuzzy_params: int = 0
+) -> np.ndarray:
+    """
+    Modified evaluation that expects a LIST of objectives from the task_eval_func.
+    Preserves Fuzzy Rule passing and Hyperparameter decoding.
+    """
+    all_obj_scores = []
+    hyperparam_keys = list(evolvable_hyperparams_config.keys()) if evolvable_hyperparams_config else []
+
+    for i, chromosome in enumerate(population):
+        try:
+            # 1. Decode Hyperparameters
+            current_hparams = {}
+            if num_hyperparams > 0:
+                hparam_genes = chromosome[:num_hyperparams]
+                current_hparams = decode_hyperparameters(hparam_genes, hyperparam_keys, evolvable_hyperparams_config)
+
+            # 2. Slice Fuzzy & Weights
+            fuzzy_start = num_hyperparams
+            weights_start = fuzzy_start + num_fuzzy_params
+            
+            fuzzy_genes = chromosome[fuzzy_start:weights_start] if use_fuzzy else None
+            weight_genes = chromosome[weights_start:]
+
+            # 3. Instantiate Model
+            merged_kwargs = {**model_kwargs_static, **current_hparams}
+            model = load_pytorch_model(model_definition_path, class_name, None, device, *model_args_static, **merged_kwargs)
+            
+            load_weights_from_flat(model, weight_genes)
+            model.to(device)
+
+            # 4. Multi-Objective Evaluation
+            # Your evaluation script must return a list/tuple: [Acc, Conf, -Latency]
+            scores = task_eval_func(model, {
+                **eval_config, 
+                'device': device, 
+                'fuzzy_rules': fuzzy_genes
+            })
+            
+            # Ensure scores is a list of floats
+            all_obj_scores.append([float(s) for s in scores])
+
+        except Exception as e:
+            logger.error(f"Error evaluating individual {i}: {e}")
+            # Dynamically match the number of objectives if possible, 
+            # or use a safe fallback based on the first successful individual
+            if all_obj_scores:
+                num_objs = len(all_obj_scores[0])
+                all_obj_scores.append([0.0] * num_objs)
+            else:
+                all_obj_scores.append([0.0, 0.0, 0.0]) # Default fallback
+
+    return np.array(all_obj_scores)
+
+def select_parents_nsga2(population: List[np.ndarray], ranks: np.ndarray, distances: np.ndarray, num_parents: int) -> List[np.ndarray]:
+    """
+    Binary Tournament Selection based on Rank and Crowding Distance.
+    """
+    parents = []
+    pop_size = len(population)
+    for _ in range(num_parents):
+        idx1, idx2 = random.sample(range(pop_size), 2)
+        # Winner has lower rank (better front) or higher distance (more diverse)
+        if ranks[idx1] < ranks[idx2]:
+            winner_idx = idx1
+        elif ranks[idx2] < ranks[idx1]:
+            winner_idx = idx2
+        else:
+            winner_idx = idx1 if distances[idx1] > distances[idx2] else idx2
+        parents.append(population[winner_idx].copy())
+    return parents
 # --- End of Helper Functions ---

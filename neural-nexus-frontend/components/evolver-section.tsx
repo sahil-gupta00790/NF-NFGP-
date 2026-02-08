@@ -38,6 +38,12 @@ const gaParameterSchema: GaParameterSchemaItem[] = [
   // --- Standard Params ---
   { name: 'generations', label: 'Generations', type: 'number', defaultValue: 20, min: 1, max: 500, step: 1, description: 'Number of generations the evolution will run.' },
   { name: 'population_size', label: 'Population Size', type: 'number', defaultValue: 30, min: 2, max: 500, step: 1, description: 'Number of individuals in each generation.' },
+  // --- NEW: NSGA-II Toggle ---
+    { name: 'nsga2_enabled', label: 'Enable NSGA-II (Multi-Objective)', type: 'boolean', defaultValue: false, description: 'Use Non-Dominated Sorting to optimize multiple objectives (e.g., Accuracy vs. Latency).' },
+    
+    // --- NEW: Neuro-Fuzzy Toggle ---
+    { name: 'use_fuzzy', label: 'Co-Evolve Fuzzy Rules', type: 'boolean', defaultValue: false, description: 'Evolve fuzzy logic behavioral rules alongside neural network weights.' },
+    { name: 'num_fuzzy_params', label: 'Fuzzy Gene Count', type: 'number', defaultValue: 10, description: 'Number of genes reserved for fuzzy membership functions/rules.' },
   { name: 'selection_strategy', label: 'Selection Strategy', type: 'select', defaultValue: 'tournament', options: [ { value: 'tournament', label: 'Tournament' }, { value: 'roulette', label: 'Roulette Wheel' } ], description: 'Method for selecting parents for reproduction.'},
   { name: 'tournament_size', label: 'Tournament Size', type: 'number', defaultValue: 3, min: 2, max: 20, step: 1, condition: (formData) => formData.selection_strategy === 'tournament', description: 'Number of individuals competing in each tournament selection.' },
   { name: 'crossover_operator', label: 'Crossover Operator', type: 'select', defaultValue: 'one_point', options: [ { value: 'one_point', label: 'One Point' }, { value: 'uniform', label: 'Uniform' }, { value: 'average', label: 'Average' } ], description: 'Method for combining parent weights to create offspring.' },
@@ -86,7 +92,7 @@ function getInitialFormData() {
   gaParameterSchema.forEach((param: GaParameterSchemaItem) => {
     initialData[param.name] = param.defaultValue ?? (param.type === 'boolean' ? false : null);
   });
-  initialData['model_class'] = 'MyCNN';
+  initialData['model_class'] = 'OCTMNIST_CNN';
   initialData['model_args'] = [];
   initialData['model_kwargs'] = {};
   initialData['evolvable_hyperparams'] = {};

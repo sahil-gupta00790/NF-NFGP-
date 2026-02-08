@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # --- IMPROVED System Prompt ---
 system_prompt_text = """
-You are an expert AI assistant specializing in neural networks, AI research, and related topics. Your goal is to provide accurate, comprehensive, and well-formatted answers.
+You are an expert AI assistant specializing in neural networks, AI ch, and related topics. Your goal is to provide accurate, comprehensive, and well-formatted answers.
 
 Follow these guidelines:
 1.  **Prioritize Context:** Base your answer primarily on the provided 'Context information'.
@@ -245,4 +245,3 @@ async def reset_chat_history():
     else:
          logger.error("Cannot reset history: Chat engine not initialized.")
          raise HTTPException(status_code=503, detail="RAG system not available.")
-

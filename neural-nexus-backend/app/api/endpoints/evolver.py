@@ -66,12 +66,11 @@ async def start_evolution(
     # --- Config Validation (Unchanged) ---
     try:
         config_data = json.loads(config_json)
-        # logger.info(f"Backend Parsed config_data (dict): {config_data}") # Log less verbosely
+        # Validate against the Pydantic model (this includes nsga2_enabled, use_fuzzy, etc.)
         config = EvolverConfig.model_validate(config_data)
-        # logger.info(f"Backend Validated Config (Pydantic model dump): {config.model_dump()}") # Log less verbosely
         logger.info("Configuration JSON validated successfully.")
     except json.JSONDecodeError:
-        logger.error(f"Invalid JSON config received.", exc_info=True) # Include traceback on error
+        logger.error(f"Invalid JSON config received.", exc_info=True)
         raise HTTPException(status_code=400, detail="Invalid JSON configuration string.")
     except Exception as e:
         logger.error(f"Invalid config data structure: {e}", exc_info=True)
@@ -81,6 +80,7 @@ async def start_evolution(
     if not use_standard_eval and task_evaluation is None:
         logger.error("Custom eval requested but no file provided.")
         raise HTTPException(status_code=400, detail="Custom evaluation script required if not using standard.")
+    
     if use_standard_eval and task_evaluation is not None:
         logger.warning("Standard eval requested but custom file also provided. Custom file will be ignored.")
         task_evaluation = None
@@ -90,172 +90,158 @@ async def start_evolution(
     model_def_path: str | None = None
     eval_path: str | None = None
     weights_path: str | None = None
-    # Context manager might be cleaner if many files
+
     try:
-        # Save Model Definition
+        # 1. Save Model Definition
         if model_definition and model_definition.filename:
             model_def_path, _ = generate_secure_path(model_definition.filename, "model_defs")
             logger.info(f"Saving model definition to: {model_def_path}")
             try:
                 await model_definition.seek(0)
                 contents = await model_definition.read()
-                if not contents: raise ValueError("Model definition file is empty.")
-                with open(model_def_path, "wb") as f: f.write(contents)
+                if not contents: 
+                    raise ValueError("Model definition file is empty.")
+                with open(model_def_path, "wb") as f: 
+                    f.write(contents)
                 saved_files['model_def'] = model_def_path
-            finally: await model_definition.close()
-        else: raise HTTPException(status_code=400, detail="Model definition file or filename missing.")
-        # Save Custom Evaluation Script
+            finally: 
+                await model_definition.close()
+        else: 
+            raise HTTPException(status_code=400, detail="Model definition file or filename missing.")
+
+        # 2. Save Custom Evaluation Script
         if task_evaluation and not use_standard_eval and task_evaluation.filename:
             eval_path, _ = generate_secure_path(task_evaluation.filename, "eval_scripts")
             logger.info(f"Saving custom eval script to: {eval_path}")
             try:
                 await task_evaluation.seek(0)
                 contents = await task_evaluation.read()
-                if not contents: raise ValueError("Custom evaluation file is empty.")
-                with open(eval_path, "wb") as f: f.write(contents)
+                if not contents: 
+                    raise ValueError("Custom evaluation file is empty.")
+                with open(eval_path, "wb") as f: 
+                    f.write(contents)
                 saved_files['eval'] = eval_path
-            finally: await task_evaluation.close()
+            finally: 
+                await task_evaluation.close()
         elif task_evaluation and not use_standard_eval and not task_evaluation.filename:
             logger.warning("Custom eval file object provided but filename missing.")
-            # Decide: Raise error or just skip? Raising is safer.
             raise HTTPException(status_code=400, detail="Custom evaluation filename missing.")
-        # Save Initial Weights
+
+        # 3. Save Initial Weights
         if initial_weights and initial_weights.filename:
             weights_path, _ = generate_secure_path(initial_weights.filename, "weights")
             logger.info(f"Saving initial weights to: {weights_path}")
             try:
                 await initial_weights.seek(0)
                 contents = await initial_weights.read()
-                if not contents: raise ValueError("Initial weights file is empty.")
-                with open(weights_path, "wb") as f: f.write(contents)
+                if not contents: 
+                    raise ValueError("Initial weights file is empty.")
+                with open(weights_path, "wb") as f: 
+                    f.write(contents)
                 saved_files['weights'] = weights_path
-            finally: await initial_weights.close()
+            finally: 
+                await initial_weights.close()
         elif initial_weights and not initial_weights.filename:
              logger.warning("Initial weights file provided but filename missing. Skipping.")
 
     except HTTPException as http_exc:
+        # Cleanup on known errors
         for file_path in saved_files.values():
             if file_path and os.path.exists(file_path): 
-                try: 
-                    os.remove(file_path) 
-                except OSError: 
-                    pass
+                try: os.remove(file_path) 
+                except OSError: pass
         raise http_exc
     except Exception as e:
         logger.error(f"Unexpected error during file processing: {e}", exc_info=True)
+        # Cleanup on unexpected errors
         for file_path in saved_files.values():
              if file_path and os.path.exists(file_path): 
-                try: 
-                    os.remove(file_path) 
-                except OSError: 
-                    pass
+                try: os.remove(file_path) 
+                except OSError: pass
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded files.")
-    # --- End file saving ---
 
-    # --- Launch Celery task (Unchanged) ---
+    # --- Launch Celery task ---
     logger.info("Dispatching evolution task to Celery...")
     try:
-        if not model_def_path: # Final check
+        if not model_def_path: # Final safety check
             raise RuntimeError("Model definition path missing before dispatch.")
 
-        config_to_send = config.model_dump() # Get dict from Pydantic model
-        # logger.debug(f"Backend Sending config to Celery task: {config_to_send}") # Reduce verbosity
+        # Convert the Pydantic model back to a dictionary to send to Celery
+        # This includes any new fields like nsga2_enabled or num_fuzzy_params
+        config_to_send = config.model_dump() 
 
         task = run_evolution_task.delay(
             model_definition_path=model_def_path,
             task_evaluation_path=eval_path,
             use_standard_eval=use_standard_eval,
             initial_weights_path=weights_path,
-            config=config_to_send # Send the validated dict
+            config=config_to_send 
         )
+        
         logger.info(f"Task dispatched with ID: {task.id}")
         return TaskResponse(task_id=task.id, status="PENDING")
+
     except Exception as dispatch_err:
          logger.error(f"Celery task dispatch failed: {dispatch_err}", exc_info=True)
-         # Cleanup saved files if dispatch fails
+         # Final cleanup if dispatch fails
          for file_path in saved_files.values():
              if file_path and os.path.exists(file_path): 
-                try: 
-                    os.remove(file_path) 
-                except OSError: 
-                    pass
+                try: os.remove(file_path) 
+                except OSError: pass
          raise HTTPException(status_code=500, detail=f"Failed to start evolution task: {dispatch_err}")
-
 
 # --- get_evolution_status (Unchanged) ---
 @router.get("/status/{task_id}", response_model=TaskStatus)
 async def get_evolution_status(task_id: str):
-    """ Get the status, progress, and metrics of an evolution task. """
-    logger.debug(f"Fetching status for task ID: {task_id}")
+    """
+    Fetches the current status of the evolution task.
+    Updated to handle Multi-Objective (NSGA-II) progress data.
+    """
     task_result = AsyncResult(task_id, app=celery_app)
-    status = task_result.status
-    info_data, progress, message, error_message = {}, None, None, None
-    try:
-        if status == 'PENDING': message = "Task is waiting to start."
-        elif status == 'STARTED': message = "Task has started."; info_data = task_result.info if isinstance(task_result.info, dict) else {}
-        elif status == 'PROGRESS': message = "Task in progress."; info_data = task_result.info if isinstance(task_result.info, dict) else {}
-        elif status == 'SUCCESS':
-            message = "Task completed successfully."; progress = 1.0
-            info_data = task_result.result if isinstance(task_result.result, dict) else {}
-            message = info_data.get("message", message)
-        elif status == 'FAILURE':
-            # Attempt to get details from result first, then info
-            if isinstance(task_result.result, dict): info_data = task_result.result
-            elif isinstance(task_result.info, dict): info_data = task_result.info
-            else: info_data = {}
-            error_message = str(info_data.get("error", task_result.info or "Unknown error"))
-            message = info_data.get("message", f"Task failed: {error_message}")
-            logger.error(f"Task {task_id} failed. Error: {error_message}")
-            progress = info_data.get("progress") # Get progress even on failure if available
-        elif status == 'REVOKED':
-            message = "Task was revoked (terminated)."
-            # Try to get last known progress from info if available
-            if isinstance(task_result.info, dict): progress = task_result.info.get("progress")
-        else: message = f"Task status: {status}"; info_data = task_result.info if isinstance(task_result.info, dict) else {}
+    
+    # Optional: Log the status check
+    # logger.debug(f"Checking status for Task ID: {task_id}. Current state: {task_result.state}")
 
-        # Update progress/message from info_data if not already set
-        if progress is None and isinstance(info_data, dict): progress = info_data.get("progress")
-        if message is None and isinstance(info_data, dict): message = info_data.get("message", f"Task status: {status}")
+    if task_result.state == 'PENDING':
+        return TaskStatus(task_id=task_id, status='PENDING', message="Task is in queue...")
 
-        # Extract histories safely from info_data
-        fitness_history = info_data.get("fitness_history") if isinstance(info_data, dict) else None
-        avg_fitness_history = info_data.get("avg_fitness_history") if isinstance(info_data, dict) else None
-        diversity_history = info_data.get("diversity_history") if isinstance(info_data, dict) else None
-        best_hyperparams = info_data.get("best_hyperparameters") if isinstance(info_data, dict) else None
+    elif task_result.state == 'PROGRESS':
+        info = task_result.info or {}
+        
+        # --- NSGA-II Multi-Objective Mapping ---
+        # The worker now sends 'avg_obj_scores' (e.g., [0.95, 0.88, 15.2])
+        # and 'generation' / 'total_generations'
+        current_gen = info.get('generation', 0)
+        total_gens = info.get('total_generations', 1)
+        
+        # Calculate a safe progress float for the frontend progress bar
+        progress_percentage = (current_gen / total_gens) if total_gens > 0 else 0.0
 
-    except Exception as e:
-        logger.error(f"Error retrieving status details for task {task_id}: {e}", exc_info=True)
-        message = f"Error fetching task details: {e}"; status = "ERROR_FETCHING_STATUS"
-        fitness_history, avg_fitness_history, diversity_history, best_hyperparams = None, None, None, None
+        return TaskStatus(
+            task_id=task_id,
+            status='PROGRESS',
+            progress=progress_percentage,
+            message=info.get('message', f"Evolving Generation {current_gen}..."),
+            # 'info' contains the 'avg_obj_scores' and 'diversity' for the frontend charts
+            info=info 
+        )
 
-    response_info, response_result = None, None
-    # Combine common info for different states
-    common_info = {
-        "fitness_history": fitness_history,
-        "avg_fitness_history": avg_fitness_history,
-        "diversity_history": diversity_history,
-        "best_hyperparameters": best_hyperparams # Include potentially partial best hyperparams
-    }
+    elif task_result.state == 'SUCCESS':
+        logger.info(f"Task {task_id} completed successfully.")
+        return TaskStatus(
+            task_id=task_id, 
+            status='SUCCESS', 
+            result=task_result.result,
+            progress=1.0
+        )
 
-    if status in ['STARTED', 'PROGRESS', 'REVOKED']: # Include REVOKED here for last known state
-        response_info = {"progress": progress, "message": message, **common_info}
-    elif status in ['SUCCESS', 'FAILURE']:
-        response_result = {
-            "final_model_path": info_data.get("final_model_path"),
-            "best_fitness": info_data.get("best_fitness"),
-            "message": message,
-            "error": error_message,
-             **common_info
-        }
+    elif task_result.state == 'FAILURE':
+        error_msg = str(task_result.info)
+        logger.error(f"Task {task_id} failed: {error_msg}")
+        return TaskStatus(task_id=task_id, status='FAILURE', message="Evolution failed.", result={"error": error_msg})
 
-    return TaskStatus(
-        task_id=task_id,
-        status=status,
-        progress=progress,
-        info=response_info, # Contains progress/message/histories for running tasks
-        result=response_result, # Contains final results/error and histories for completed tasks
-        message=message # Overall message summary
-    )
+    # For REVOKED or other states
+    return TaskStatus(task_id=task_id, status=task_result.state, message=f"Task state: {task_result.state}")
 
 
 # --- NEW: Redis-based Cooperative Halt Endpoint ---

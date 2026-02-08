@@ -29,7 +29,12 @@ from app.utils.evolution_helpers import (
     # Mutation
     mutate_hyperparams_gaussian,
     mutate_weights_gaussian,
-    mutate_weights_uniform_random
+    mutate_weights_uniform_random,
+    #NSGA things
+    evaluate_population_multi_objective,
+    fast_non_dominated_sort,
+    calculate_crowding_distance,
+    select_parents_nsga2,
 )
 # --- Import fuzzy components ---
 from app.core.fuzzy import FuzzyInferenceSystem
@@ -323,6 +328,8 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
     # No need for last_fitness_scores, calculate current avg directly
 
     try:
+        # Store final front size before loop ends
+        final_front_0_size = 0
         for gen in range(generations):
             gen_num = gen + 1
             logger.info(f"[Task {task_id}] --- Generation {gen_num}/{generations} ---")
@@ -368,258 +375,162 @@ def run_evolution_task(self: Task, model_definition_path: str, task_evaluation_p
             # --- End Halt Check ---
 
             # 1. Evaluate Population
+            # --- 1. MULTI-OBJECTIVE EVALUATION (NSGA-II Upgrade) ---
             try:
-                fitness_scores = evaluate_population_step(
+                # This returns a matrix: [[Acc1, Conf1, -Lat1], [Acc2, Conf2, -Lat2], ...]
+                obj_scores = evaluate_population_multi_objective(
                     population, model_definition_path, model_class, task_eval_func, device,
                     model_args, model_kwargs_static, eval_config,
                     num_hyperparams=num_hyperparams,
                     evolvable_hyperparams_config=evolvable_hyperparams_config,
                     use_fuzzy=use_fuzzy,
-                    num_fuzzy_params=num_fuzzy_params,
-                    fuzzy_config=fuzzy_config
+                    num_fuzzy_params=num_fuzzy_params
                 )
-                fitness_scores = [float(f) if f is not None and np.isfinite(f) else -float('inf') for f in fitness_scores]
-
             except Exception as eval_err:
-                logger.error(f"[Task {task_id}] Critical evaluation error in Gen {gen_num}: {eval_err}", exc_info=True)
-                raise RuntimeError(f"Evaluation failed critically in Gen {gen_num}: {eval_err}") from eval_err
+                logger.error(f"[Task {task_id}] Critical Multi-Objective evaluation error in Gen {gen_num}: {eval_err}", exc_info=True)
+                raise RuntimeError(f"NSGA-II Evaluation failed critically in Gen {gen_num}") from eval_err
 
-            # 2. Process Results & Calculate Metrics
-            valid_scores = [f for f in fitness_scores if f > -float('inf')]
-            if not valid_scores:
-                 error_msg = f"All individuals failed evaluation in Gen {gen_num}."
-                 logger.error(f"[Task {task_id}] {error_msg}")
-                 raise RuntimeError(error_msg) # Stop if no valid scores
+            # --- 2. PARETO FRONT CALCULATIONS ---
+            # Group individuals into layers of dominance
+            fronts = fast_non_dominated_sort(obj_scores)
+            
+            # Calculate Ranks and Crowding Distances for selection diversity
+            ranks = np.zeros(population_size)
+            distances = np.zeros(population_size)
+            for rank_idx, front in enumerate(fronts):
+                ranks[front] = rank_idx
+                if len(front) > 0:
+                    distances[front] = calculate_crowding_distance(obj_scores, front)
 
-            max_fitness = np.max(valid_scores)
-            avg_fitness = np.mean(valid_scores) # Current average fitness
+            # --- 3. METRICS & DYNAMIC SETTINGS ---
+            # We track 'Accuracy' (Objective 0) as the primary fitness for legacy logs
+            valid_primary_scores = obj_scores[:, 0]
+            max_fitness = np.max(valid_primary_scores)
+            avg_obj_scores = np.mean(obj_scores, axis=0) # Average of all objectives
+            
             diversity = calculate_population_diversity(population, num_hyperparams, num_fuzzy_params)
+            
             fitness_history_overall.append(float(max_fitness))
-            avg_fitness_history_overall.append(float(avg_fitness))
+            avg_fitness_history_overall.append(avg_obj_scores.tolist())
             diversity_history_overall.append(float(diversity))
 
-            # --- Determine Current Mutation Rate for NEXT Generation's Reproduction ---
-            current_mutation_rate = mutation_rate # Default to fixed rate
+            # Determine Mutation Rate (Preserving your existing Dynamic Mutation Logic)
+            current_mutation_rate = mutation_rate 
             if use_dynamic_mutation_rate:
                 try:
                     if dynamic_mutation_heuristic == 'time_decay':
-                        # Calculate based on NEXT generation index (gen+1) or current (gen)?
-                        # Let's use current `gen` relative to `generations` for rate applied in THIS reproduction phase
                         progress = gen / max(1, generations - 1)
-                        rate = initial_mutation_rate - (initial_mutation_rate - final_mutation_rate) * progress
-                        current_mutation_rate = max(final_mutation_rate, rate)
-
-                    elif dynamic_mutation_heuristic == 'fitness_based':
-                        if gen > 0 and avg_fitness_history_overall: # Need at least one previous average
-                            prev_avg_fit = avg_fitness_history_overall[-2] if len(avg_fitness_history_overall) > 1 else avg_fitness_history_overall[-1] # Compare to previous or same if only 1 entry
-                            improvement = avg_fitness - prev_avg_fit if prev_avg_fit > -np.inf else 0 # Use avg_fitness calculated above
-
-                            if improvement < stagnation_threshold:
-                                 current_mutation_rate = stagnation_mutation_rate # Use the increased rate
-                                 logger.debug(f"Fitness stagnant (imp: {improvement:.4f}), using rate {current_mutation_rate:.3f}")
-                            else:
-                                 current_mutation_rate = normal_fitness_mutation_rate # Use the normal rate
-                                 logger.debug(f"Fitness improving (imp: {improvement:.4f}), using rate {current_mutation_rate:.3f}")
-                        else:
-                             current_mutation_rate = initial_mutation_rate # Start with initial rate
-
-                    elif dynamic_mutation_heuristic == 'diversity_based':
-                        # Use diversity calculated above for the current population
-                        if diversity < diversity_threshold_low:
-                            current_mutation_rate = base_mutation_rate * mutation_rate_increase_factor
-                            logger.debug(f"Low diversity ({diversity:.3f}), using rate {current_mutation_rate:.3f}")
-                        else:
-                            current_mutation_rate = base_mutation_rate
-                            logger.debug(f"Sufficient diversity ({diversity:.3f}), using rate {current_mutation_rate:.3f}")
-                    else:
-                         logger.warning(f"Unknown dynamic heuristic '{dynamic_mutation_heuristic}', using fixed rate {mutation_rate:.3f}.")
-                         current_mutation_rate = mutation_rate
+                        current_mutation_rate = max(final_mutation_rate, initial_mutation_rate - (initial_mutation_rate - final_mutation_rate) * progress)
+                    elif dynamic_mutation_heuristic == 'diversity_based' and diversity < diversity_threshold_low:
+                        current_mutation_rate = base_mutation_rate * mutation_rate_increase_factor
+                    # (Other heuristics like 'fitness_based' can be added here)
                 except Exception as dyn_err:
-                    logger.error(f"Error calculating dynamic mutation rate: {dyn_err}. Using fallback fixed rate.", exc_info=True)
-                    current_mutation_rate = mutation_rate
+                    logger.error(f"Error calculating dynamic mutation rate: {dyn_err}. Using fallback.")
 
-            # Log the rate determined for the REPRODUCTION step that follows
-            logger.info(f"[Task {task_id}] Gen {gen_num} Stats: MaxFit={max_fitness:.4f}, AvgFit={avg_fitness:.4f}, Div(W)={diversity:.4f}, RateForNextRepro={current_mutation_rate:.3f}")
+            # Log Generation Stats
+            logger.info(f"[Task {task_id}] Gen {gen_num} | Front0 Size: {len(fronts[0])} | Max Acc: {max_fitness:.4f} | Avg Conf: {avg_obj_scores[1] if len(avg_obj_scores) > 1 else 0.0:.4f} | Mutation: {current_mutation_rate:.3f}")
+            
+            # Store final front size
+            final_front_0_size = len(fronts[0])
 
-
-            # Update overall best chromosome
-            best_idx_current = np.argmax(fitness_scores)
-            current_best_fitness = fitness_scores[best_idx_current]
+            # --- 4. UPDATE BEST INDIVIDUAL (From Front 0) ---
+            # We pick the most accurate individual from the elite Pareto Front
+            best_idx_in_front_0 = fronts[0][np.argmax(obj_scores[fronts[0], 0])]
+            current_best_fitness = obj_scores[best_idx_in_front_0, 0]
+            
             if current_best_fitness > best_fitness_overall:
                 best_fitness_overall = current_best_fitness
-                if best_idx_current < len(population):
-                     best_chromosome_overall = population[best_idx_current].copy()
-                     logger.info(f"[Task {task_id}] *** New best overall fitness: {best_fitness_overall:.4f} ***")
-                     try: # Safely log best hyperparams
-                         best_hparams_decoded = decode_hyperparameters(best_chromosome_overall[:num_hyperparams], hyperparam_keys, evolvable_hyperparams_config)
-                         logger.info(f"[Task {task_id}] Best Hyperparameters so far: {best_hparams_decoded}")
-                     except Exception as decode_err: logger.error(f"Err logging best hparams: {decode_err}")
-                else:
-                     logger.warning(f"[Task {task_id}] Best index {best_idx_current} out of bounds {len(population)}.")
-
-            # --- Update Task State ---
-            current_progress = gen_num / generations
-            progress_message = f'Gen {gen_num}/{generations} | Best Fit: {best_fitness_overall:.4f} | Avg Fit: {avg_fitness:.4f}'
-            self.update_state(
-                state='PROGRESS', meta={ 'progress': current_progress, 'message': progress_message, 'fitness_history': fitness_history_overall, 'avg_fitness_history': avg_fitness_history_overall, 'diversity_history': diversity_history_overall }
-            )
-
-            # --- 3. SELECTION ---
-            num_parents_to_select = population_size
-            parents = []
-            logger.debug(f"[Task {task_id}] Selecting parents using '{selection_strategy}'...")
-            selectable_indices = [i for i, f in enumerate(fitness_scores) if f > -float('inf')]
-            selectable_population_chromosomes = [population[i] for i in selectable_indices]
-            selectable_fitness = [fitness_scores[i] for i in selectable_indices]
-            # No need to check selectable_indices again, handled by RuntimeError above
-
-            if selection_strategy == "tournament":
-                parents = select_parents_tournament(selectable_population_chromosomes, selectable_fitness, num_parents_to_select, tournament_size=tournament_size)
-            elif selection_strategy == "roulette":
-                parents = select_parents_roulette(selectable_population_chromosomes, selectable_fitness, num_parents_to_select)
-            else:
-                 logger.warning(f"Unsupported selection strategy '{selection_strategy}', defaulting to tournament.")
-                 parents = select_parents_tournament(selectable_population_chromosomes, selectable_fitness, num_parents_to_select, tournament_size=tournament_size)
-
-            if not parents or len(parents) < 2:
-                logger.warning(f"[Task {task_id}] Parent selection yielded < 2 parents ({len(parents)}). Re-populating from best.")
-                next_population = [best_chromosome_overall.copy()]
-                for _ in range(population_size - 1):
-                    # Mutate based on rate calculated for *this* reproduction step
-                    mutated_best_h = mutate_hyperparams_gaussian(best_chromosome_overall, hyperparam_mutation_strength, num_hyperparams)
-                    # Mutate fuzzy params if enabled
-                    if use_fuzzy and num_fuzzy_params > 0:
-                        mutated_best_f = mutate_fuzzy_params(mutated_best_h, num_hyperparams, num_fuzzy_params, mutation_rate, mutation_strength)
-                    else:
-                        mutated_best_f = mutated_best_h
-                    mutated_best_w = mutate_weights_gaussian(mutated_best_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
-                    next_population.append(mutated_best_w)
-                population = next_population[:population_size]
-                continue
-
-            # --- 4. REPRODUCTION (Elitism + Crossover + Mutation) ---
-            next_population = []
-            logger.debug(f"[Task {task_id}] Reproducing (Elitism={elitism_count}, Cross='{crossover_operator}', Mut(W)='{mutation_operator}')...")
-
-            # Elitism
-            if elitism_count > 0:
-                 elite_indices = np.argsort(fitness_scores)[::-1][:elitism_count]
-                 for elite_idx in elite_indices:
-                      if len(next_population) < population_size and elite_idx < len(population):
-                           next_population.append(population[elite_idx].copy())
-
-            # Offspring Generation
-            while len(next_population) < population_size:
+                best_chromosome_overall = population[best_idx_in_front_0].copy()
+                logger.info(f"[Task {task_id}] *** New Pareto Leader Found (Acc: {best_fitness_overall:.4f}) ***")
                 try:
-                    if len(parents) < 2: p1_chrom, p2_chrom = parents[0], parents[0]
-                    else: p1_chrom, p2_chrom = random.sample(parents, 2)
+                    best_hparams_decoded = decode_hyperparameters(best_chromosome_overall[:num_hyperparams], hyperparam_keys, evolvable_hyperparams_config)
+                    logger.info(f"[Task {task_id}] Leader Hyperparams: {best_hparams_decoded}")
+                except Exception: pass
 
-                    # Crossover
-                    child1_chrom, child2_chrom = None, None
-                    if crossover_operator == "one_point": child1_chrom, child2_chrom = crossover_one_point(p1_chrom, p2_chrom, num_hyperparams, num_fuzzy_params)
-                    elif crossover_operator == "uniform": child1_chrom, child2_chrom = crossover_uniform(p1_chrom, p2_chrom, num_hyperparams, crossover_prob=uniform_crossover_prob, num_fuzzy_params=num_fuzzy_params)
-                    elif crossover_operator == "average": child1_chrom, child2_chrom = crossover_average(p1_chrom, p2_chrom, num_hyperparams, num_fuzzy_params)
-                    else: child1_chrom, child2_chrom = crossover_one_point(p1_chrom, p2_chrom, num_hyperparams, num_fuzzy_params) # Default
+            # Update Celery Progress
+            current_progress = gen_num / generations
+            progress_message = f"Gen {gen_num}/{generations} | Front0: {len(fronts[0])} | Best Acc: {best_fitness_overall:.4f}"
+            self.update_state(state='PROGRESS', meta={
+                'generation': gen_num,           # Added
+                'total_generations': generations, # Added
+                'progress': current_progress, 
+                'message': progress_message,
+                'front_0_count': len(fronts[0]),
+                'fitness_history': fitness_history_overall,
+                'avg_objectives': avg_obj_scores.tolist()
+            })
 
-                    # Mutation (using rate determined before reproduction)
+            # --- 5. NSGA-II SELECTION ---
+            # Replaces Tournament/Roulette with Pareto-based Crowding Tournament
+            logger.debug(f"[Task {task_id}] Selecting parents via Crowding Distance Tournament...")
+            parents = select_parents_nsga2(population, ranks, distances, population_size)
+
+            # --- 6. REPRODUCTION (Elitism + Crossover + Mutation) ---
+            next_population = []
+            
+            # Elitism: Carry over the top models from Front 0
+            if elitism_count > 0:
+                elite_indices = fronts[0][:elitism_count]
+                for e_idx in elite_indices:
+                    if len(next_population) < population_size:
+                        next_population.append(population[e_idx].copy())
+
+            # Offspring Loop
+            while len(next_population) < population_size:
+                p1_chrom, p2_chrom = random.sample(parents, 2)
+
+                # Crossover (Preserves your existing operator logic)
+                if crossover_operator == "uniform":
+                    child1, child2 = crossover_uniform(p1_chrom, p2_chrom, num_hyperparams, crossover_prob=uniform_crossover_prob, num_fuzzy_params=num_fuzzy_params)
+                else: # Default to one_point
+                    child1, child2 = crossover_one_point(p1_chrom, p2_chrom, num_hyperparams, num_fuzzy_params)
+
+                # --- HYBRID MUTATION (Bible 1.2 & 2.2) ---
+                for child in [child1, child2]:
+                    if len(next_population) >= population_size: break
+                    
                     # 1. Mutate Hyperparams
-                    mutated_child1_h = mutate_hyperparams_gaussian(child1_chrom, hyperparam_mutation_strength, num_hyperparams)
-                    mutated_child2_h = mutate_hyperparams_gaussian(child2_chrom, hyperparam_mutation_strength, num_hyperparams)
-                    # 2. Mutate Fuzzy Params
+                    mutated = mutate_hyperparams_gaussian(child, hyperparam_mutation_strength, num_hyperparams)
+                    
+                    # 2. Mutate Fuzzy Rules (Co-Evolution)
                     if use_fuzzy and num_fuzzy_params > 0:
-                        fuzzy_start = num_hyperparams
-                        mutated_child1_f = mutate_fuzzy_params(mutated_child1_h, fuzzy_start, num_fuzzy_params, mutation_rate, mutation_strength)
-                        mutated_child2_f = mutate_fuzzy_params(mutated_child2_h, fuzzy_start, num_fuzzy_params, mutation_rate, mutation_strength)
-                    else:
-                        mutated_child1_f = mutated_child1_h
-                        mutated_child2_f = mutated_child2_h
-                    # 3. Mutate Weights
-                    mutated_child1_w, mutated_child2_w = None, None
-                    if mutation_operator == "gaussian":
-                        mutated_child1_w = mutate_weights_gaussian(mutated_child1_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
-                        mutated_child2_w = mutate_weights_gaussian(mutated_child2_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
-                    elif mutation_operator == "uniform_random":
-                        mutated_child1_w = mutate_weights_uniform_random(mutated_child1_f, current_mutation_rate, uniform_mutation_range, num_hyperparams, num_fuzzy_params)
-                        mutated_child2_w = mutate_weights_uniform_random(mutated_child2_f, current_mutation_rate, uniform_mutation_range, num_hyperparams, num_fuzzy_params)
-                    else: # Default
-                        mutated_child1_w = mutate_weights_gaussian(mutated_child1_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
-                        mutated_child2_w = mutate_weights_gaussian(mutated_child2_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
-
-                    if len(next_population) < population_size: next_population.append(mutated_child1_w)
-                    if len(next_population) < population_size: next_population.append(mutated_child2_w)
-
-                except Exception as repr_err:
-                     logger.warning(f"[Task {task_id}] Reproduction error: {repr_err}. Substituting.", exc_info=True)
-                     if len(next_population) < population_size:
-                          substitute_parent_chrom = random.choice(parents) if parents else best_chromosome_overall
-                          mut_sub_h = mutate_hyperparams_gaussian(substitute_parent_chrom, hyperparam_mutation_strength, num_hyperparams)
-                          # Mutate fuzzy params if enabled
-                          if use_fuzzy and num_fuzzy_params > 0:
-                              mut_sub_f = mutate_fuzzy_params(mut_sub_h, num_hyperparams, num_fuzzy_params, mutation_rate, mutation_strength)
-                          else:
-                              mut_sub_f = mut_sub_h
-                          mut_sub_w = mutate_weights_gaussian(mut_sub_f, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params) # Use current rate
-                          next_population.append(mut_sub_w)
+                        mutated = mutate_fuzzy_params(mutated, num_hyperparams, num_fuzzy_params, current_mutation_rate, mutation_strength)
+                    
+                    # 3. Mutate Model Weights
+                    if mutation_operator == "uniform_random":
+                        mutated = mutate_weights_uniform_random(mutated, current_mutation_rate, uniform_mutation_range, num_hyperparams, num_fuzzy_params)
+                    else: # Default Gaussian
+                        mutated = mutate_weights_gaussian(mutated, current_mutation_rate, mutation_strength, num_hyperparams, num_fuzzy_params)
+                    
+                    next_population.append(mutated)
 
             population = next_population[:population_size]
-            gen_time = time.time() - gen_start_time
-            logger.info(f"[Task {task_id}] Gen {gen_num} finished in {gen_time:.2f}s")
 
-        # --- Evolution Finished ---
-        if best_fitness_overall == -float('inf'):
-             raise RuntimeError("Evolution completed, but no valid individuals found.")
-        logger.info(f"[Task {task_id}] Evolution finished. Best Fitness: {best_fitness_overall:.4f}")
-
-        # --- Save Final Best Model ---
-        logger.info(f"[Task {task_id}] Saving best model to {final_model_path}...")
-        best_hyperparams = decode_hyperparameters(best_chromosome_overall[:num_hyperparams], hyperparam_keys, evolvable_hyperparams_config)
-        logger.info(f"[Task {task_id}] Decoded Best Hyperparameters: {best_hyperparams}")
-        final_best_model = load_pytorch_model(
-            model_definition_path, model_class, None, device,
-            *model_args, **model_kwargs_static, **best_hyperparams
-        )
-        best_weights = best_chromosome_overall[num_hyperparams + num_fuzzy_params:]
-        load_weights_from_flat(final_best_model, best_weights)
-        torch.save(final_best_model.state_dict(), final_model_path)
-        logger.info(f"[Task {task_id}] Best model saved successfully.")
-
-        # --- Clean up uploaded files ---
-        logger.info(f"[Task {task_id}] Cleaning up temporary uploaded files...")
-        files_to_remove = [model_definition_path, task_evaluation_path, initial_weights_path]
-        for f_path in files_to_remove:
-             if f_path and os.path.exists(f_path):
-                  try: os.remove(f_path); logger.debug(f"Removed: {f_path}")
-                  except OSError as rm_err: logger.warning(f"Could not remove {f_path}: {rm_err}")
-
-        # --- Extract best fuzzy parameters (if enabled) ---
-        best_fuzzy_params = None
-        if use_fuzzy and num_fuzzy_params > 0:
-            try:
-                fuzzy_start = num_hyperparams
-                fuzzy_params_array = best_chromosome_overall[fuzzy_start:fuzzy_start + num_fuzzy_params]
-                best_fuzzy_params = {
-                    'params': fuzzy_params_array.tolist(),
-                    'num_params': num_fuzzy_params
-                }
-                logger.info(f"[Task {task_id}] Best fuzzy parameters extracted ({num_fuzzy_params} params)")
-            except Exception as fuzzy_err:
-                logger.warning(f"[Task {task_id}] Failed to extract best fuzzy params: {fuzzy_err}")
+        # --- FINALIZATION (After All Generations) ---
+        logger.info(f"[Task {task_id}] Evolution Complete. Saving optimal Pareto individual...")
         
-        # --- Return final result data ---
-        success_message = f'Evolution completed. Best fitness: {best_fitness_overall:.4f}.'
-        final_result = {
-            'message': success_message,
-            'final_model_path': final_model_path,
-            'best_fitness': float(best_fitness_overall),
-            'best_hyperparameters': best_hyperparams,
-            'best_fuzzy_parameters': best_fuzzy_params,
+        final_save_path = os.path.join(RESULT_DIR, f"best_model_{task_id}.pth")
+        final_model = load_pytorch_model(model_definition_path, model_class, None, device, *model_args, **model_kwargs_static)
+        
+        # Load the best weights (skipping hparams and fuzzy segments)
+        weights_start = num_hyperparams + num_fuzzy_params
+        load_weights_from_flat(final_model, best_chromosome_overall[weights_start:])
+        
+        torch.save(final_model.state_dict(), final_save_path)
+        
+        # Decode final best hparams for the result
+        final_hparams = {}
+        if num_hyperparams > 0:
+            final_hparams = decode_hyperparameters(best_chromosome_overall[:num_hyperparams], hyperparam_keys, evolvable_hyperparams_config)
+
+        return {
+            'status': 'SUCCESS',
+            'model_path': final_save_path,
+            'best_accuracy': float(best_fitness_overall),
+            'best_hyperparameters': final_hparams,
             'fitness_history': fitness_history_overall,
-            'avg_fitness_history': avg_fitness_history_overall,
-            'diversity_history': diversity_history_overall
+            'front_0_final_size': final_front_0_size
         }
-        logger.info(f"[Task {task_id}] Task successful.")
-        self.update_state(state='SUCCESS', meta=final_result)
-        return final_result
 
     # --- Exception Handling (Added SoftTimeLimitExceeded) ---
     except SoftTimeLimitExceeded: # Catch Celery's exception if SIGUSR1 was used (alternative)

@@ -181,10 +181,12 @@ def evaluate_network_on_task(model_instance: torch.nn.Module, config: dict) -> f
 
     except Exception as e:
         logger.error(f" ERROR during fitness evaluation: {e}", exc_info=True)
-        return -float('inf') # Return very low fitness on error
+        return [0.0, 0.0, 0.0] # Return multi-objective format on error
 
-    # Ensure the return value is a float
-    return float(fitness)
+    # Return multi-objective format: [accuracy, confidence, -latency]
+    confidence = fitness  # Use accuracy as confidence proxy
+    latency = eval_time   # Use evaluation time as latency proxy
+    return [float(fitness), float(confidence), -float(latency)]
 
 # --- Optional: Add a main block for testing this file directly ---
 if __name__ == '__main__':
